@@ -1129,7 +1129,7 @@ local head = new("Frame", { Size = UDim2.new(1, 0, 0, HEAD_H), BackgroundColor3 
 corner(head, 12)
 new("Frame", { Size = UDim2.new(1, 0, 0, 12), Position = UDim2.new(0, 0, 1, -12), BackgroundColor3 = T.headBg, BorderSizePixel = 0 }, head)
 label(head, "M O S E E R I   W A T C H", 26, T.white, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(28, 22), Size = UDim2.new(1, -120, 0, 32) })
-label(head, "Anime Nexus RNG X · auto farm", 12, T.mute, Enum.Font.Gotham, { Position = UDim2.fromOffset(28, 56), Size = UDim2.new(1, -120, 0, 16) })
+label(head, "recorder · scanner", 12, T.mute, Enum.Font.Gotham, { Position = UDim2.fromOffset(28, 56), Size = UDim2.new(1, -120, 0, 16) })
 local rng = Random.new(7)
 for _ = 1, 26 do
     local s = rng:NextInteger(1, 2)
