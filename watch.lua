@@ -8,9 +8,11 @@ if G.__mwatch_stop then pcall(G.__mwatch_stop) end
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
+-- autoexec can run before the player exists: wait for it, or every LP use fails and the player's scripts are never dumped
 local LP = Players.LocalPlayer
+while not LP do task.wait(0.2) LP = Players.LocalPlayer end
 local FOLDER = "mwatch"
-local VERSION = "watch_2"
+local VERSION = "watch_3"
 
 local F = {
     alive = true,
@@ -843,13 +845,23 @@ local function dumpScripts()
     if type(decompile) ~= "function" then W.scanStatus = "no decompile in this executor" return end
     local dir = FOLDER .. "/src_" .. tostring(game.PlaceId)
     pcall(function() if not isfolder(dir) then makefolder(dir) end end)
-    local list = {}
-    for _, r in ipairs({ RS, game:GetService("ReplicatedFirst"), LP, game:GetService("StarterPlayer"), game:GetService("StarterGui"), game:GetService("StarterPack") }) do
-        pcall(function()
-            for _, d in ipairs(r:GetDescendants()) do
-                if d:IsA("LocalScript") or d:IsA("ModuleScript") then list[#list + 1] = d end
-            end
-        end)
+    local list, seen = {}, {}
+    local function add(d)
+        if typeof(d) == "Instance" and not seen[d] and (d:IsA("LocalScript") or d:IsA("ModuleScript")) then
+            seen[d] = true
+            list[#list + 1] = d
+        end
+    end
+    local roots = { RS, game:GetService("ReplicatedFirst"), LP, workspace, game:GetService("StarterPlayer"), game:GetService("StarterGui"), game:GetService("StarterPack") }
+    for _, r in ipairs(roots) do
+        pcall(function() for _, d in ipairs(r:GetDescendants()) do add(d) end end)
+    end
+    -- scripts the game hid (parented to nil) or loaded from elsewhere: read-only lists from the executor
+    for _, fname in ipairs({ "getscripts", "getloadedmodules", "getrunningscripts", "getnilinstances" }) do
+        local fn = G[fname] or getfenv(0)[fname]
+        if type(fn) == "function" then
+            pcall(function() for _, d in ipairs(fn()) do add(d) end end)
+        end
     end
     local index, okN = { "# " .. #list .. " scripts | PlaceId " .. tostring(game.PlaceId) .. " | " .. os.date("%Y-%m-%d %H:%M:%S") }, 0
     for i, s in ipairs(list) do
