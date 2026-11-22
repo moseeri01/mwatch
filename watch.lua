@@ -12,7 +12,7 @@ local HttpService = game:GetService("HttpService")
 local LP = Players.LocalPlayer
 while not LP do task.wait(0.2) LP = Players.LocalPlayer end
 local FOLDER = "mwatch"
-local VERSION = "watch_3"
+local VERSION = "watch_4"
 
 local F = {
     alive = true,
@@ -601,7 +601,19 @@ local function tree(root, maxDepth, out, cap)
             if kids > 0 then out[#out + 1] = string.rep("  ", depth + 1) .. "(" .. kids .. " children not shown)" end
             return
         end
-        for _, ch in ipairs(o:GetChildren()) do walk(ch, depth + 1) end
+        -- many copies of the same child (OceanTile x25, Motor6D x9): show 5, then one "+N more" line
+        local kids = o:GetChildren()
+        local cnt, shown = {}, {}
+        for _, ch in ipairs(kids) do local k = ch.ClassName .. " " .. ch.Name cnt[k] = (cnt[k] or 0) + 1 end
+        for _, ch in ipairs(kids) do
+            local k = ch.ClassName .. " " .. ch.Name
+            local s = shown[k] or 0
+            if s < 5 then shown[k] = s + 1 walk(ch, depth + 1)
+            elseif s == 5 then
+                shown[k] = 6
+                if #out < cap then out[#out + 1] = string.rep("  ", depth + 1) .. "(+" .. (cnt[k] - 5) .. " more " .. k .. ")" end
+            end
+        end
     end
     pcall(walk, root, 0)
     if #out >= cap then out[#out + 1] = "(cut at " .. cap .. " lines)" end
@@ -659,7 +671,7 @@ local function scanMap()
     local mePos = me and me.Position
     out[#out + 1] = "me at " .. (mePos and v3(mePos) or "?")
     local function dist(p) return (mePos and p) and string.format("%.0f", (p - mePos).Magnitude) or "?" end
-    local npcs, prompts, clicks, touch, seats, tools, spawns = {}, {}, {}, {}, {}, {}, {}
+    local npcs, prompts, clicks, touch, seats, tools, spawns, creatures = {}, {}, {}, {}, {}, {}, {}, {}
     local playerChars = {}
     for _, p in ipairs(Players:GetPlayers()) do if p.Character then playerChars[p.Character] = true end end
     local n = 0
@@ -672,6 +684,14 @@ local function scanMap()
                 npcs[#npcs + 1] = string.format("NPC %s | hp %.0f/%.0f speed %.0f | dist %s at %s | %s%s", d.Parent.Name, d.Health, d.MaxHealth,
                     d.WalkSpeed, dist(p), p and v3(p) or "?", fullName(d.Parent), attrText(d.Parent))
                 addKnown("NPC", d.Parent.Name, string.format("maxhp %.0f at %s | %s", d.MaxHealth, p and v3(p) or "?", fullName(d.Parent)), true)
+            elseif d:IsA("Model") and not playerChars[d] and #creatures < 400 and not d:FindFirstChildOfClass("Humanoid")
+                and (d:FindFirstChild("Data") or d:GetAttribute("Health") ~= nil or d:GetAttribute("MaxHealth") ~= nil or d:FindFirstChild("HumanoidRootPart")) then
+                -- mobs / animals built without a Humanoid (Creatures of Sonaria: stats live on a Data folder's attributes)
+                local p = posOf(d)
+                local data = d:FindFirstChild("Data")
+                local stats = (attrText(d) .. (data and (" data" .. attrText(data)) or "")):sub(1, 400)
+                creatures[#creatures + 1] = string.format("CREATURE %s | dist %s at %s | %s%s", d.Name, dist(p), p and v3(p) or "?", fullName(d), stats)
+                addKnown("NPC", d.Name, string.format("no humanoid at %s | %s", p and v3(p) or "?", fullName(d)), true)
             elseif d:IsA("ProximityPrompt") then
                 local p = d.Parent and posOf(d.Parent)
                 addKnown("PROMPT", fullName(d), string.format("%q / %q at %s", d.ActionText, d.ObjectText, p and v3(p) or "?"), true)
@@ -697,8 +717,63 @@ local function scanMap()
         out[#out + 1] = "\n## " .. title .. " (" .. #list .. ")"
         for _, l in ipairs(list) do out[#out + 1] = l end
     end
-    section("NPCs", npcs) section("proximity prompts", prompts) section("click detectors", clicks)
+    section("NPCs", npcs) section("creatures without Humanoid", creatures) section("proximity prompts", prompts) section("click detectors", clicks)
     section("touch parts", touch) section("seats", seats) section("tools on the ground", tools) section("spawns", spawns)
+
+    -- game folders: games that skip Humanoids / prompts keep their things (food, lakes, nodes, mobs) in folders.
+    -- Every folder down to 5 levels: child count by class, then the nearest 5 things with position + attributes.
+    out[#out + 1] = "\n## game folders (count + nearest 5 each)"
+    local cap = #out + 3500
+    local fn = 0
+    local function folderWalk(f, depth)
+        if #out >= cap or depth > 5 then return end
+        local kids = f:GetChildren()
+        local things, subs, classes, order = {}, {}, {}, {}
+        for _, ch in ipairs(kids) do
+            fn = fn + 1
+            if fn % 1500 == 0 then task.wait() end
+            if ch:IsA("Folder") then subs[#subs + 1] = ch
+            elseif not playerChars[ch] then
+                things[#things + 1] = ch
+                if not classes[ch.ClassName] then classes[ch.ClassName] = 0 order[#order + 1] = ch.ClassName end
+                classes[ch.ClassName] = classes[ch.ClassName] + 1
+            end
+        end
+        local cls = {}
+        for _, c in ipairs(order) do cls[#cls + 1] = classes[c] .. " " .. c end
+        out[#out + 1] = string.rep("  ", depth) .. "FOLDER " .. fullName(f) .. " | " .. #kids .. " children" .. (#cls > 0 and (" (" .. table.concat(cls, ", ") .. ")") or "") .. attrText(f)
+        if #things > 0 then
+            local withD = {}
+            for _, t in ipairs(things) do
+                local p = posOf(t)
+                withD[#withD + 1] = { t = t, p = p, d = (p and mePos) and (p - mePos).Magnitude or math.huge }
+            end
+            table.sort(withD, function(a, b) return a.d < b.d end)
+            for i = 1, math.min(5, #withD) do
+                local e = withD[i]
+                local kidNames = {}
+                for j, c in ipairs(e.t:GetChildren()) do
+                    if j > 6 then kidNames[#kidNames + 1] = "..." break end
+                    kidNames[#kidNames + 1] = c.Name
+                end
+                local val = ""
+                pcall(function() val = valueText(e.t) end)
+                out[#out + 1] = string.format("%s  - %s %s%s | dist %s at %s%s%s", string.rep("  ", depth), e.t.ClassName, e.t.Name, val,
+                    e.p and string.format("%.0f", e.d) or "?", e.p and v3(e.p) or "?",
+                    #kidNames > 0 and (" | kids " .. table.concat(kidNames, ",")) or "", attrText(e.t):sub(1, 300))
+            end
+        end
+        for _, s in ipairs(subs) do folderWalk(s, depth + 1) end
+    end
+    for _, top in ipairs(workspace:GetChildren()) do
+        if top:IsA("Folder") then pcall(folderWalk, top, 0) end
+    end
+    -- some games park map things under Terrain (Sonaria: Terrain.VolcanoBiome.HexRocks / Interactables)
+    for _, top in ipairs(workspace.Terrain:GetChildren()) do
+        if top:IsA("Folder") then pcall(folderWalk, top, 0) end
+    end
+    if #out >= cap then out[#out + 1] = "(game folders cut)" end
+
     out[#out + 1] = "\n## workspace top levels"
     tree(workspace, 2, out, #out + 2500)
     out[#out + 1] = "\n## other players (" .. (#Players:GetPlayers() - 1) .. ")"
@@ -922,6 +997,9 @@ local function autoScan()
     if not F.alive or not F.cfg.autoScan then return end
     for _, s in ipairs({ { scanMe, "me" }, { scanMap, "map" }, { scanScreen, "screen" }, { scanGame, "game" } }) do
         if not alreadyScanned(s[2]) then
+            -- a Dump pressed meanwhile holds the busy flag for minutes; wait instead of skipping (Sonaria 11-22 lost screen + game)
+            local tw = os.clock()
+            while scanning and F.alive and os.clock() - tw < 600 do task.wait(1) end
             runScan(s[1], s[2])
             task.wait(1)
         end
@@ -1087,6 +1165,151 @@ F.conns[#F.conns + 1] = { Disconnect = function()
     pcall(flush)
     for _, c in ipairs(W.conns) do pcall(function() c:Disconnect() end) end
 end }
+
+--------------------------------------------------------------------------------
+-- Dupe lab (sandbox): a self-contained race playground. Touches NOTHING in the
+-- game - only tables in memory - so it keeps the "reads only" rule. It does NOT
+-- scan the real game for dupes (a client cannot see server code); it reproduces
+-- the "check -> yield -> write" dupe so a guard can be watched catching it.
+--------------------------------------------------------------------------------
+local DL = { status = "idle", broken = 0, lockOn = false, log = {}, last = "-" }
+F.dupelab = DL
+do
+    local lab = {}
+    local busy = false
+    local function dlog(msg)
+        DL.log[#DL.log + 1] = tostring(msg)
+        if #DL.log > 60 then table.remove(DL.log, 1) end
+        DL.last = tostring(msg)
+    end
+    local function reset()
+        lab.A = { Sword = 1 }
+        lab.B = {}
+        lab.Bank = {}
+        lab.Ground = {}
+        lab.GoldA = 100
+        lab.Rewards = {}
+        lab.Minted = 0
+        lab.Burned = 0
+        lab.RewardGrants = 0
+    end
+    local function countItems()
+        local total = 0
+        for _, bag in ipairs({ lab.A, lab.B, lab.Bank, lab.Ground }) do
+            for _, amount in pairs(bag) do total = total + amount end
+        end
+        return total
+    end
+    local function check()
+        -- item conservation: catches transfer + sell dupes
+        local expected = 1 + lab.Minted - lab.Burned
+        local have = countItems()
+        if have ~= expected then
+            DL.broken = DL.broken + 1
+            dlog(string.format("BROKEN items: have %d expected %d", have, expected))
+        end
+        -- claim-once: catches reward dupes (item check can't - a mint is "authorized")
+        local claims = 0
+        for _ in pairs(lab.Rewards) do claims = claims + 1 end
+        if lab.RewardGrants > claims then
+            DL.broken = DL.broken + 1
+            dlog(string.format("BROKEN reward: granted %dx for %d claim", lab.RewardGrants, claims))
+        end
+    end
+    -- guard: one lock for the whole lab. When on, a second action waits until the
+    -- first fully finishes (including its slow yield), so no stale read -> no dupe.
+    local function withLock(fn)
+        if DL.lockOn then
+            while busy do task.wait() end
+            busy = true
+            local ok, err = pcall(fn)
+            busy = false
+            if not ok then dlog("err " .. tostring(err)) end
+        else
+            fn()
+        end
+    end
+    local function transfer(from, to, label, slow)
+        withLock(function()
+            local amount = from.Sword or 0        -- check
+            if amount <= 0 then dlog(label .. " failed: source empty") return end
+            if slow then task.wait() end          -- race window: yield after read, before write
+            from.Sword = amount - 1               -- write using the value read before the yield
+            if from.Sword == 0 then from.Sword = nil end
+            to.Sword = (to.Sword or 0) + 1
+            dlog(label .. " ok")
+        end)
+    end
+    local function sell(slow)
+        withLock(function()
+            local amount = lab.A.Sword or 0
+            if amount <= 0 then dlog("Sell failed: no Sword") return end
+            if slow then task.wait() end
+            lab.A.Sword = amount - 1
+            if lab.A.Sword == 0 then lab.A.Sword = nil end
+            lab.GoldA = lab.GoldA + 50
+            lab.Burned = lab.Burned + 1
+            dlog("Sell ok")
+        end)
+    end
+    local function reward(slow)
+        withLock(function()
+            if lab.Rewards.Daily then dlog("Reward denied: already claimed") return end
+            if slow then task.wait() end
+            lab.Rewards.Daily = true
+            lab.A.Sword = (lab.A.Sword or 0) + 1
+            lab.Minted = lab.Minted + 1
+            lab.RewardGrants = lab.RewardGrants + 1
+            dlog("Reward ok")
+        end)
+    end
+    local actions = {
+        Trade    = function(slow) transfer(lab.A, lab.B, "Trade", slow) end,
+        Drop     = function(slow) transfer(lab.A, lab.Ground, "Drop", slow) end,
+        Pickup   = function(slow) transfer(lab.Ground, lab.B, "Pickup", slow) end,
+        Deposit  = function(slow) transfer(lab.A, lab.Bank, "Deposit", slow) end,
+        Withdraw = function(slow) transfer(lab.Bank, lab.A, "Withdraw", slow) end,
+        Sell     = sell,
+        Reward   = reward,
+    }
+    local names = { "Trade", "Drop", "Pickup", "Deposit", "Withdraw", "Sell", "Reward" }
+    -- fire several actions "at the same time": they interleave through their yields
+    local function fireConcurrent(picks, slow)
+        local running = 0
+        for _, nm in ipairs(picks) do
+            local fn = actions[nm]
+            if fn then
+                running = running + 1
+                task.spawn(function() pcall(fn, slow) running = running - 1 end)
+            end
+        end
+        while running > 0 do task.wait() end
+    end
+    DL.raceOnce = function()
+        reset()
+        DL.broken = 0
+        fireConcurrent({ "Trade", "Deposit" }, true) -- both pull A's single Sword
+        check()
+        DL.status = string.format("race Trade+Deposit: broke %d (guard %s)", DL.broken, DL.lockOn and "ON" or "OFF")
+        dlog(DL.status)
+    end
+    DL.scan = function(rounds)
+        rounds = rounds or 200
+        DL.broken = 0
+        DL.status = "scanning..."
+        for _ = 1, rounds do
+            reset()
+            local a = names[math.random(#names)]
+            local b = names[math.random(#names)]
+            fireConcurrent({ a, b }, true) -- slow=true forces the race window
+            check()
+        end
+        DL.status = string.format("fuzz %d rounds: broke %d (guard %s)", rounds, DL.broken, DL.lockOn and "ON" or "OFF")
+        dlog(DL.status)
+    end
+    reset()
+end
+
 --------------------------------------------------------------------------------
 -- UI: own window in the moseeri hub (AA) style - wide, tabs across the top, two columns of cards.
 -- Same theme values as AA (UIRef.Theme). No MacLib.
@@ -1489,6 +1712,18 @@ UI.input(se, "Skip names", "ping, mouse", function() return F.cfg.watchSkip end,
 UI.info(se, "Resume after teleport", function() return F.cfg.watchResume and "yes" or "no" end)
 UI.info(se, "Version", function() return VERSION end)
 UI.note(se, "Files: Workspace/mwatch/<game>/<map>/ - index.txt and known.txt per game.")
+
+local labP = UI.page("Lab", 5)
+local lb = UI.card(labP, 1, "Dupe lab (sandbox)")
+UI.toggle(lb, "Guard (per-player lock)", function() return DL.lockOn end, function(v) DL.lockOn = v end)
+UI.button(lb, "Race two actions once", "Run", function() DL.raceOnce() end)
+UI.button(lb, "Fuzz 200 random pairs", "Scan", function() DL.scan(200) end)
+UI.info(lb, "Broke", function() return DL.broken end)
+UI.info(lb, "Result", function() return DL.status end)
+UI.info(lb, "Last line", function() return DL.last end)
+local lb2 = UI.card(labP, 2, "What this is")
+UI.note(lb2, "Memory-only sandbox. It does NOT touch the game and does NOT scan the real game for dupes - a client cannot see server code. It reproduces the check -> yield -> write race so a guard can be watched catching it.")
+UI.note(lb2, "Guard OFF: scan should break (dupe found) = the tool works. Guard ON: scan should break 0 = the lock holds. Single-server only; cross-server dupes need a DataStore model.")
 
 -- window button + floating Mark button (works while the window is hidden)
 local tb = new("TextButton", { Name = "Toggle", Size = UDim2.fromOffset(52, 30), Position = UDim2.new(1, -200, 0, 120),
