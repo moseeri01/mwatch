@@ -1311,6 +1311,160 @@ do
 end
 
 --------------------------------------------------------------------------------
+-- Cross-server lab (sandbox): a mock DataStore + two servers, to reproduce the
+-- dupes the single-server lab cannot see - a player loaded on two servers at
+-- once (double session), and a trade whose save is lost in a crash. Still
+-- memory-only; touches nothing in the game. Guards: session lock, atomic trade.
+--------------------------------------------------------------------------------
+local DL2 = { status = "idle", broken = 0, lockOn = false, atomicOn = false, log = {}, last = "-" }
+F.dupelab2 = DL2
+do
+    local M = {}
+    local function d2log(msg)
+        DL2.log[#DL2.log + 1] = tostring(msg)
+        if #DL2.log > 60 then table.remove(DL2.log, 1) end
+        DL2.last = tostring(msg)
+    end
+    local function reset2()
+        M.store = { Sword = 1 }   -- what is saved on disk for player A
+        M.vault = { Sword = 0 }   -- items that left A to a friend / trade output (persist separately)
+        M.escrow = 0              -- items in flight during a two-phase trade
+        M.S1 = { active = false, copy = nil }
+        M.S2 = { active = false, copy = nil }
+        M.lock = nil              -- session lock: which server owns A's key
+        M.failNextSave = false
+    end
+    -- the one true count: whatever server(s) hold A right now + the vault + in-flight.
+    -- if nobody holds A, the saved store is the truth. A dupe shows up as total > 1.
+    local function worldTotal()
+        local total = M.vault.Sword + M.escrow
+        local anyActive = false
+        if M.S1.active and M.S1.copy then total = total + M.S1.copy.Sword anyActive = true end
+        if M.S2.active and M.S2.copy then total = total + M.S2.copy.Sword anyActive = true end
+        if not anyActive then total = total + M.store.Sword end
+        return total
+    end
+    local function check2()
+        local have = worldTotal()
+        if have ~= 1 then
+            DL2.broken = DL2.broken + 1
+            d2log(string.format("BROKEN: world has %d expected 1", have))
+        end
+    end
+    local function acquire(name)
+        if not DL2.lockOn then return true end
+        if M.lock == nil then M.lock = name return true end
+        return M.lock == name
+    end
+    local function release(name)
+        if M.lock == name then M.lock = nil end
+    end
+    local function load(sv, name)
+        if not acquire(name) then d2log(name .. " load blocked (session held by " .. tostring(M.lock) .. ")") return false end
+        sv.copy = { Sword = M.store.Sword }
+        sv.active = true
+        d2log(name .. " loaded Sword=" .. sv.copy.Sword)
+        return true
+    end
+    local function save(sv, name)
+        if not (sv.active and sv.copy) then return false end
+        if M.failNextSave then
+            M.failNextSave = false
+            d2log(name .. " SAVE FAILED (store kept old value)")
+            return false
+        end
+        M.store = { Sword = sv.copy.Sword }
+        d2log(name .. " saved Sword=" .. M.store.Sword)
+        return true
+    end
+    local function leave(sv, name)
+        local saved = save(sv, name)
+        sv.active = false
+        sv.copy = nil
+        if saved then release(name) end  -- a failed save keeps the lock (a safe stall, not a dupe)
+        return saved
+    end
+    -- give A's sword to the vault. atomic = remove + save first, hand over only if the save lands.
+    local function trade(sv, name)
+        if not (sv.active and sv.copy) then d2log(name .. " trade: A not loaded here") return end
+        if sv.copy.Sword <= 0 then d2log(name .. " trade: no sword") return end
+        if DL2.atomicOn then
+            sv.copy.Sword = sv.copy.Sword - 1
+            M.escrow = M.escrow + 1              -- held, not yet the friend's
+            local saved = save(sv, name)
+            if saved then
+                M.escrow = M.escrow - 1
+                M.vault.Sword = M.vault.Sword + 1
+                d2log(name .. " trade committed (saved, then handed over)")
+            else
+                M.escrow = M.escrow - 1
+                sv.copy.Sword = sv.copy.Sword + 1 -- roll the trade back
+                d2log(name .. " trade rolled back (save failed)")
+            end
+        else
+            sv.copy.Sword = sv.copy.Sword - 1
+            M.vault.Sword = M.vault.Sword + 1     -- handed over before any save = the dupe window
+            d2log(name .. " traded sword to vault")
+        end
+    end
+    local function sState(s) return s.active and ("A(" .. (s.copy and s.copy.Sword or "?") .. ")") or "-" end
+    DL2.state = function()
+        return string.format("store=%d vault=%d esc=%d S1=%s S2=%s lock=%s",
+            M.store.Sword, M.vault.Sword, M.escrow, sState(M.S1), sState(M.S2), tostring(M.lock or "-"))
+    end
+    -- demo 1: A loaded on two servers at once (fast rejoin). Needs session lock.
+    DL2.doubleSession = function()
+        reset2()
+        DL2.broken = 0
+        load(M.S1, "S1")   -- A joins S1 (Sword=1)
+        load(M.S2, "S2")   -- A also loads on S2 - two live sessions
+        trade(M.S1, "S1")  -- each session hands "its" sword to a friend
+        trade(M.S2, "S2")
+        check2()
+        DL2.status = string.format("double session: broke %d (lock %s)", DL2.broken, DL2.lockOn and "ON" or "OFF")
+        d2log(DL2.status)
+    end
+    -- demo 2: the server crashes after the trade but before the save lands. Needs atomic trade.
+    DL2.crashTrade = function()
+        reset2()
+        DL2.broken = 0
+        load(M.S1, "S1")        -- A on S1 (Sword=1)
+        M.failNextSave = true   -- the server will crash before the save lands
+        trade(M.S1, "S1")       -- hand sword to friend; atomic rolls it back, non-atomic keeps it
+        M.S1.active = false      -- crash: session gone, nothing saved
+        M.S1.copy = nil
+        check2()
+        DL2.status = string.format("crash mid-trade: broke %d (atomic %s)", DL2.broken, DL2.atomicOn and "ON" or "OFF")
+        d2log(DL2.status)
+    end
+    local ops = { "loadS1", "loadS2", "tradeS1", "tradeS2", "leaveS1", "leaveS2", "fail" }
+    local function doOp(op)
+        if op == "loadS1" then load(M.S1, "S1")
+        elseif op == "loadS2" then load(M.S2, "S2")
+        elseif op == "tradeS1" then trade(M.S1, "S1")
+        elseif op == "tradeS2" then trade(M.S2, "S2")
+        elseif op == "leaveS1" then leave(M.S1, "S1")
+        elseif op == "leaveS2" then leave(M.S2, "S2")
+        elseif op == "fail" then M.failNextSave = true end
+    end
+    DL2.fuzz = function(rounds)
+        rounds = rounds or 200
+        DL2.broken = 0
+        DL2.status = "fuzzing..."
+        for _ = 1, rounds do
+            reset2()
+            local steps = 3 + math.random(4)
+            for _ = 1, steps do doOp(ops[math.random(#ops)]) end
+            check2()
+        end
+        DL2.status = string.format("fuzz %d: broke %d (lock %s, atomic %s)", rounds, DL2.broken,
+            DL2.lockOn and "ON" or "OFF", DL2.atomicOn and "ON" or "OFF")
+        d2log(DL2.status)
+    end
+    reset2()
+end
+
+--------------------------------------------------------------------------------
 -- UI: own window in the moseeri hub (AA) style - wide, tabs across the top, two columns of cards.
 -- Same theme values as AA (UIRef.Theme). No MacLib.
 --------------------------------------------------------------------------------
@@ -1714,16 +1868,27 @@ UI.info(se, "Version", function() return VERSION end)
 UI.note(se, "Files: Workspace/mwatch/<game>/<map>/ - index.txt and known.txt per game.")
 
 local labP = UI.page("Lab", 5)
-local lb = UI.card(labP, 1, "Dupe lab (sandbox)")
+-- single-server race (in-memory): the check -> yield -> write dupe
+local lb = UI.card(labP, 1, "Single-server race")
 UI.toggle(lb, "Guard (per-player lock)", function() return DL.lockOn end, function(v) DL.lockOn = v end)
 UI.button(lb, "Race two actions once", "Run", function() DL.raceOnce() end)
 UI.button(lb, "Fuzz 200 random pairs", "Scan", function() DL.scan(200) end)
 UI.info(lb, "Broke", function() return DL.broken end)
 UI.info(lb, "Result", function() return DL.status end)
 UI.info(lb, "Last line", function() return DL.last end)
-local lb2 = UI.card(labP, 2, "What this is")
-UI.note(lb2, "Memory-only sandbox. It does NOT touch the game and does NOT scan the real game for dupes - a client cannot see server code. It reproduces the check -> yield -> write race so a guard can be watched catching it.")
-UI.note(lb2, "Guard OFF: scan should break (dupe found) = the tool works. Guard ON: scan should break 0 = the lock holds. Single-server only; cross-server dupes need a DataStore model.")
+UI.note(lb, "Memory-only, touches nothing in the game. Guard OFF: breaks (dupe found) = the tool works. Guard ON: 0.")
+
+-- cross-server (mock DataStore + two servers): double session + crash-mid-trade dupes
+local lx = UI.card(labP, 2, "Cross-server (DataStore)")
+UI.toggle(lx, "Session lock", function() return DL2.lockOn end, function(v) DL2.lockOn = v end)
+UI.toggle(lx, "Atomic trade", function() return DL2.atomicOn end, function(v) DL2.atomicOn = v end)
+UI.button(lx, "Double session", "Run", function() DL2.doubleSession() end)
+UI.button(lx, "Crash mid-trade", "Run", function() DL2.crashTrade() end)
+UI.button(lx, "Fuzz 200 sequences", "Scan", function() DL2.fuzz(200) end)
+UI.info(lx, "Broke", function() return DL2.broken end)
+UI.info(lx, "Result", function() return DL2.status end)
+UI.info(lx, "State", function() return DL2.state() end)
+UI.note(lx, "Double session needs Session lock. Crash mid-trade needs Atomic trade. Fuzz reaches 0 only when BOTH guards are ON.")
 
 -- window button + floating Mark button (works while the window is hidden)
 local tb = new("TextButton", { Name = "Toggle", Size = UDim2.fromOffset(52, 30), Position = UDim2.new(1, -200, 0, 120),
